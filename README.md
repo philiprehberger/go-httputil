@@ -88,6 +88,13 @@ client := httputil.NewClient(
 | `RoundTripperFunc` | Adapter type: function as http.RoundTripper |
 | `Middleware` | Type: func(http.RoundTripper) http.RoundTripper |
 
+## Development
+
+```bash
+go test ./...
+go vet ./...
+```
+
 ## License
 
 MIT
