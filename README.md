@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/philiprehberger/go-httputil.svg)](https://pkg.go.dev/github.com/philiprehberger/go-httputil)
 [![License](https://img.shields.io/github/license/philiprehberger/go-httputil)](LICENSE)
 
-Composable HTTP client middleware for Go. Build instrumented `http.Client` instances with zero hassle.
+Composable HTTP client middleware for Go. Build instrumented `http.Client` instances with zero hassle
 
 ## Installation
 
