@@ -1,8 +1,6 @@
 # go-httputil
 
-[![CI](https://github.com/philiprehberger/go-httputil/actions/workflows/ci.yml/badge.svg)](https://github.com/philiprehberger/go-httputil/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/philiprehberger/go-httputil.svg)](https://pkg.go.dev/github.com/philiprehberger/go-httputil)
-[![License](https://img.shields.io/github/license/philiprehberger/go-httputil)](LICENSE)
+[![CI](https://github.com/philiprehberger/go-httputil/actions/workflows/ci.yml/badge.svg)](https://github.com/philiprehberger/go-httputil/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/philiprehberger/go-httputil.svg)](https://pkg.go.dev/github.com/philiprehberger/go-httputil) [![License](https://img.shields.io/github/license/philiprehberger/go-httputil)](LICENSE)
 
 Composable HTTP client middleware for Go. Build instrumented `http.Client` instances with zero hassle
 
