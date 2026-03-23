@@ -2,10 +2,12 @@ package httputil
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -229,4 +231,296 @@ func TestWithTimeoutSuccess(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp.Body.Close()
+}
+
+func TestWithRetryRecoversFrom500(t *testing.T) {
+	var count int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&count, 1)
+		if n < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithMiddleware(WithRetry(3, 1*time.Millisecond)))
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&count) != 3 {
+		t.Errorf("expected 3 attempts, got %d", atomic.LoadInt32(&count))
+	}
+}
+
+func TestWithRetryNetworkError(t *testing.T) {
+	attempts := 0
+	client := NewClient(
+		WithMiddleware(WithRetry(3, 1*time.Millisecond)),
+		WithBaseTransport(RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			return nil, fmt.Errorf("connection refused")
+		})),
+	)
+
+	_, err := client.Get("http://example.invalid")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestWithRetrySkipsNonIdempotent(t *testing.T) {
+	var count int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&count, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithMiddleware(WithRetry(3, 1*time.Millisecond)))
+
+	req, _ := http.NewRequest("POST", srv.URL, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if atomic.LoadInt32(&count) != 1 {
+		t.Errorf("expected 1 attempt for POST, got %d", atomic.LoadInt32(&count))
+	}
+}
+
+func TestWithRetryRespectsContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithMiddleware(WithRetry(5, 10*time.Second)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL, nil)
+	_, err := client.Do(req)
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+}
+
+func TestWithRetryNoRetryOn200(t *testing.T) {
+	var count int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&count, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithMiddleware(WithRetry(3, 1*time.Millisecond)))
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if atomic.LoadInt32(&count) != 1 {
+		t.Errorf("expected 1 attempt, got %d", atomic.LoadInt32(&count))
+	}
+}
+
+func TestWithMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	var gotMethod, gotURL string
+	var gotStatus int
+	var gotDuration time.Duration
+
+	client := NewClient(WithMiddleware(WithMetrics(func(method, url string, status int, duration time.Duration) {
+		gotMethod = method
+		gotURL = url
+		gotStatus = status
+		gotDuration = duration
+	})))
+
+	resp, err := client.Get(srv.URL + "/test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotMethod != "GET" {
+		t.Errorf("expected method GET, got %q", gotMethod)
+	}
+	if gotURL != srv.URL+"/test" {
+		t.Errorf("expected URL %q, got %q", srv.URL+"/test", gotURL)
+	}
+	if gotStatus != http.StatusCreated {
+		t.Errorf("expected status 201, got %d", gotStatus)
+	}
+	if gotDuration <= 0 {
+		t.Errorf("expected positive duration, got %v", gotDuration)
+	}
+}
+
+func TestWithMetricsOnError(t *testing.T) {
+	var gotStatus int
+	client := NewClient(
+		WithMiddleware(WithMetrics(func(method, url string, status int, duration time.Duration) {
+			gotStatus = status
+		})),
+		WithBaseTransport(RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network error")
+		})),
+	)
+
+	_, err := client.Get("http://example.invalid")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if gotStatus != 0 {
+		t.Errorf("expected status 0 on error, got %d", gotStatus)
+	}
+}
+
+func TestWithBaseURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Got-Path", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithBaseURL(srv.URL))
+
+	resp, err := client.Get("/users/123")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := resp.Header.Get("X-Got-Path"); got != "/users/123" {
+		t.Errorf("expected path /users/123, got %q", got)
+	}
+}
+
+func TestWithBaseURLTrailingSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Got-Path", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Trailing slash on base URL, leading slash on path.
+	client := NewClient(WithBaseURL(srv.URL + "/"))
+
+	resp, err := client.Get("/items")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := resp.Header.Get("X-Got-Path"); got != "/items" {
+		t.Errorf("expected path /items, got %q", got)
+	}
+}
+
+func TestWithBaseURLNoLeadingSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Got-Path", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithBaseURL(srv.URL))
+
+	resp, err := client.Get("health")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := resp.Header.Get("X-Got-Path"); got != "/health" {
+		t.Errorf("expected path /health, got %q", got)
+	}
+}
+
+func TestWithOnRequest(t *testing.T) {
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Injected")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(WithMiddleware(WithOnRequest(func(r *http.Request) {
+		r.Header.Set("X-Injected", "hook-value")
+	})))
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotHeader != "hook-value" {
+		t.Errorf("expected 'hook-value', got %q", gotHeader)
+	}
+}
+
+func TestWithOnResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Server", "test-server")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var gotHeader string
+	client := NewClient(WithMiddleware(WithOnResponse(func(resp *http.Response) {
+		gotHeader = resp.Header.Get("X-Server")
+	})))
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotHeader != "test-server" {
+		t.Errorf("expected 'test-server', got %q", gotHeader)
+	}
+}
+
+func TestWithOnResponseNotCalledOnError(t *testing.T) {
+	called := false
+	client := NewClient(
+		WithMiddleware(WithOnResponse(func(resp *http.Response) {
+			called = true
+		})),
+		WithBaseTransport(RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("connection refused")
+		})),
+	)
+
+	_, err := client.Get("http://example.invalid")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if called {
+		t.Error("expected OnResponse not to be called on network error")
+	}
 }

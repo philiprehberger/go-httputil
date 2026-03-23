@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -133,4 +134,124 @@ func WithTimeout(d time.Duration) ClientOption {
 			return next.RoundTrip(r)
 		})
 	})
+}
+
+// isIdempotent reports whether the HTTP method is considered idempotent and
+// therefore safe to retry.
+func isIdempotent(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// WithRetry returns a [Middleware] that retries requests on 5xx status codes or
+// network errors. It uses exponential backoff (backoff * 2^attempt) between
+// retries. Only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) are
+// retried; non-idempotent methods pass through without retry.
+//
+// maxAttempts is the total number of attempts including the initial request
+// (e.g., 3 means one initial attempt plus up to two retries).
+func WithRetry(maxAttempts int, backoff time.Duration) Middleware {
+	return func(next http.RoundTripper) http.RoundTripper {
+		return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			if !isIdempotent(r.Method) {
+				return next.RoundTrip(r)
+			}
+
+			var resp *http.Response
+			var err error
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				if attempt > 0 {
+					delay := backoff * (1 << (attempt - 1))
+					select {
+					case <-time.After(delay):
+					case <-r.Context().Done():
+						return nil, r.Context().Err()
+					}
+				}
+
+				resp, err = next.RoundTrip(r)
+				if err != nil {
+					continue
+				}
+				if resp.StatusCode < 500 {
+					return resp, nil
+				}
+				// Drain and close the body so the connection can be reused.
+				if resp.Body != nil {
+					resp.Body.Close()
+				}
+			}
+			return resp, err
+		})
+	}
+}
+
+// WithMetrics returns a [Middleware] that calls fn after each request completes
+// with the HTTP method, URL, response status code, and request duration. If the
+// request fails with a network error, the status code passed to fn is 0.
+func WithMetrics(fn func(method, url string, status int, duration time.Duration)) Middleware {
+	return func(next http.RoundTripper) http.RoundTripper {
+		return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			start := time.Now()
+			resp, err := next.RoundTrip(r)
+			elapsed := time.Since(start)
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			fn(r.Method, r.URL.String(), status, elapsed)
+			return resp, err
+		})
+	}
+}
+
+// WithBaseURL returns a [ClientOption] that prepends baseURL to every request
+// URL. Trailing slashes on baseURL and leading slashes on the request path are
+// deduplicated so that exactly one slash separates them.
+func WithBaseURL(baseURL string) ClientOption {
+	return WithMiddleware(func(next http.RoundTripper) http.RoundTripper {
+		return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			r = r.Clone(r.Context())
+			base := strings.TrimRight(baseURL, "/")
+			path := strings.TrimLeft(r.URL.String(), "/")
+			parsed, err := http.NewRequest(r.Method, base+"/"+path, r.Body)
+			if err != nil {
+				return nil, err
+			}
+			parsed.Header = r.Header
+			return next.RoundTrip(parsed)
+		})
+	})
+}
+
+// WithOnRequest returns a [Middleware] that calls fn before each request is
+// sent. The function receives a clone of the request for inspection or
+// modification.
+func WithOnRequest(fn func(*http.Request)) Middleware {
+	return func(next http.RoundTripper) http.RoundTripper {
+		return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			r = r.Clone(r.Context())
+			fn(r)
+			return next.RoundTrip(r)
+		})
+	}
+}
+
+// WithOnResponse returns a [Middleware] that calls fn after each request
+// completes successfully. The function receives the response for inspection.
+// If the request fails with a network error, fn is not called.
+func WithOnResponse(fn func(*http.Response)) Middleware {
+	return func(next http.RoundTripper) http.RoundTripper {
+		return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			resp, err := next.RoundTrip(r)
+			if err != nil {
+				return resp, err
+			}
+			fn(resp)
+			return resp, nil
+		})
+	}
 }

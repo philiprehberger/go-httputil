@@ -20,9 +20,11 @@ client := httputil.NewClient(
     httputil.WithRequestID(),
     httputil.WithLogging(slog.Default()),
     httputil.WithTimeout(10 * time.Second),
+    httputil.WithMiddleware(httputil.WithRetry(3, 500*time.Millisecond)),
+    httputil.WithBaseURL("https://api.example.com"),
 )
 
-resp, err := client.Get("https://api.example.com/data")
+resp, err := client.Get("/data")
 ```
 
 The returned `*http.Client` is standard — pass it anywhere an `http.Client` is accepted.
@@ -36,6 +38,11 @@ The returned `*http.Client` is standard — pass it anywhere an `http.Client` is
 - **WithHeaders(headers)** — inject multiple static headers
 - **WithLogging(logger)** — log method, URL, status, and duration via slog
 - **WithTimeout(duration)** — enforce a per-request timeout
+- **WithRetry(maxAttempts, backoff)** — retry on 5xx/network errors with exponential backoff
+- **WithMetrics(fn)** — call a function with method, URL, status, and duration after each request
+- **WithBaseURL(baseURL)** — prepend a base URL to all requests
+- **WithOnRequest(fn)** — pre-request hook for inspection/modification
+- **WithOnResponse(fn)** — post-response hook for inspection
 
 ### Request ID Propagation
 
@@ -45,6 +52,60 @@ Attach a request ID to the context, then let the middleware propagate it:
 ctx := httputil.WithRequestIDValue(context.Background(), "req-abc-123")
 req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.example.com", nil)
 resp, err := client.Do(req)
+```
+
+### Retry
+
+Automatically retry failed requests with exponential backoff. Only idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE) are retried:
+
+```go
+client := httputil.NewClient(
+    httputil.WithMiddleware(httputil.WithRetry(3, 500*time.Millisecond)),
+)
+
+// Retries up to 3 total attempts on 5xx or network errors.
+// Backoff: 500ms, 1s (exponential: backoff * 2^attempt).
+resp, err := client.Get("https://api.example.com/data")
+```
+
+### Metrics
+
+Collect request metrics by providing a callback:
+
+```go
+client := httputil.NewClient(
+    httputil.WithMiddleware(httputil.WithMetrics(func(method, url string, status int, duration time.Duration) {
+        log.Printf("%s %s -> %d (%s)", method, url, status, duration)
+    })),
+)
+```
+
+### Base URL
+
+Prepend a base URL to all requests, with automatic slash deduplication:
+
+```go
+client := httputil.NewClient(
+    httputil.WithBaseURL("https://api.example.com/v1"),
+)
+
+// Requests to "/users" become "https://api.example.com/v1/users"
+resp, err := client.Get("/users")
+```
+
+### Hooks
+
+Inspect or modify requests and responses with hook middleware:
+
+```go
+client := httputil.NewClient(
+    httputil.WithMiddleware(httputil.WithOnRequest(func(r *http.Request) {
+        r.Header.Set("X-Custom", "value")
+    })),
+    httputil.WithMiddleware(httputil.WithOnResponse(func(resp *http.Response) {
+        log.Printf("response status: %d", resp.StatusCode)
+    })),
+)
 ```
 
 ### Custom Middleware
@@ -81,6 +142,11 @@ client := httputil.NewClient(
 | `WithHeaders(headers map[string]string) ClientOption` | Inject multiple static headers |
 | `WithLogging(logger *slog.Logger) ClientOption` | Log requests with slog |
 | `WithTimeout(d time.Duration) ClientOption` | Per-request timeout |
+| `WithRetry(maxAttempts int, backoff time.Duration) Middleware` | Retry on 5xx/network errors with exponential backoff |
+| `WithMetrics(fn func(method, url string, status int, duration time.Duration)) Middleware` | Collect request metrics via callback |
+| `WithBaseURL(baseURL string) ClientOption` | Prepend base URL to all requests |
+| `WithOnRequest(fn func(*http.Request)) Middleware` | Pre-request hook |
+| `WithOnResponse(fn func(*http.Response)) Middleware` | Post-response hook |
 | `WithRequestIDValue(ctx, id) context.Context` | Set request ID in context |
 | `RequestIDFromContext(ctx) string` | Get request ID from context |
 | `RoundTripperFunc` | Adapter type: function as http.RoundTripper |
